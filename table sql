@@ -1,0 +1,194 @@
+-- DuckDB SQL
+-- Compares two temperature datasets (GISTEMP 1200km and 250km) on a common 2x2 degree grid,
+-- using land-fraction weights aggregated from a 0.5x0.5 land fraction grid.
+-- Output: a table of percent change over time vs a baseline period.
+
+-- ----------------------------
+-- USER SETTINGS
+-- ----------------------------
+-- Baseline window for percent-change reference
+-- Change these to what you want (e.g., 1951-1980 is common, but your data availability may differ).
+WITH
+params AS (
+  SELECT
+    DATE '1951-01-01' AS baseline_start,
+    DATE '1980-12-31' AS baseline_end
+),
+
+-- ----------------------------
+-- INGEST FILES
+-- ----------------------------
+land05 AS (
+  SELECT
+    CAST(lat AS DOUBLE) AS lat,
+    CAST(lon AS DOUBLE) AS lon,
+    CAST(land_frac AS DOUBLE) AS land_frac
+  FROM read_parquet('data/land_fraction_0p5deg.parquet')
+),
+
+t1200 AS (
+  SELECT
+    CAST(date AS DATE) AS date,
+    CAST(lat AS DOUBLE) AS lat,
+    CAST(lon AS DOUBLE) AS lon,
+    CAST(temp_c AS DOUBLE) AS temp_c
+  FROM read_parquet('data/gistemp1200.parquet')
+),
+
+t250 AS (
+  SELECT
+    CAST(date AS DATE) AS date,
+    CAST(lat AS DOUBLE) AS lat,
+    CAST(lon AS DOUBLE) AS lon,
+    CAST(temp_c AS DOUBLE) AS temp_c
+  FROM read_parquet('data/gistemp250.parquet')
+),
+
+-- ----------------------------
+-- NORMALIZE TO A COMMON 2x2 DEG GRID
+-- Define 2-degree grid cell "ids" by snapping lat/lon to 2-degree bins.
+-- This creates a consistent grid key across datasets.
+-- ----------------------------
+land2 AS (
+  SELECT
+    floor((lat + 90.0) / 2.0) * 2.0 - 90.0 AS lat2,
+    floor((lon + 180.0) / 2.0) * 2.0 - 180.0 AS lon2,
+    SUM(land_frac) AS land_frac_sum,
+    COUNT(*) AS n_cells
+  FROM land05
+  GROUP BY 1, 2
+),
+
+t1200_2 AS (
+  SELECT
+    date,
+    floor((lat + 90.0) / 2.0) * 2.0 - 90.0 AS lat2,
+    floor((lon + 180.0) / 2.0) * 2.0 - 180.0 AS lon2,
+    AVG(temp_c) AS temp_c_avg
+  FROM t1200
+  GROUP BY 1, 2, 3
+),
+
+t250_2 AS (
+  SELECT
+    date,
+    floor((lat + 90.0) / 2.0) * 2.0 - 90.0 AS lat2,
+    floor((lon + 180.0) / 2.0) * 2.0 - 180.0 AS lon2,
+    AVG(temp_c) AS temp_c_avg
+  FROM t250
+  GROUP BY 1, 2, 3
+),
+
+-- ----------------------------
+-- APPLY LAND-FRACTION WEIGHTS (optional but common)
+-- If you want a land-weighted global(ish) index, we weight each 2x2 cell by land fraction.
+-- If you instead want per-grid-cell comparisons, skip the weighting section.
+-- ----------------------------
+t1200_weighted AS (
+  SELECT
+    t.date,
+    t.lat2,
+    t.lon2,
+    t.temp_c_avg,
+    COALESCE(l.land_frac_sum, 0.0) AS land_w
+  FROM t1200_2 t
+  LEFT JOIN land2 l
+    USING (lat2, lon2)
+),
+
+t250_weighted AS (
+  SELECT
+    t.date,
+    t.lat2,
+    t.lon2,
+    t.temp_c_avg,
+    COALESCE(l.land_frac_sum, 0.0) AS land_w
+  FROM t250_2 t
+  LEFT JOIN land2 l
+    USING (lat2, lon2)
+),
+
+-- ----------------------------
+-- COMPUTE LAND-WEIGHTED MEAN TEMPERATURE PER DATE (one value per dataset per date)
+-- ----------------------------
+series_1200 AS (
+  SELECT
+    date,
+    SUM(temp_c_avg * land_w) / NULLIF(SUM(land_w), 0.0) AS temp_landweighted
+  FROM t1200_weighted
+  GROUP BY 1
+),
+
+series_250 AS (
+  SELECT
+    date,
+    SUM(temp_c_avg * land_w) / NULLIF(SUM(land_w), 0.0) AS temp_landweighted
+  FROM t250_weighted
+  GROUP BY 1
+),
+
+-- ----------------------------
+-- BASELINE MEANS (reference)
+-- ----------------------------
+baseline_1200 AS (
+  SELECT
+    AVG(s.temp_landweighted) AS base
+  FROM series_1200 s, params p
+  WHERE s.date BETWEEN p.baseline_start AND p.baseline_end
+),
+
+baseline_250 AS (
+  SELECT
+    AVG(s.temp_landweighted) AS base
+  FROM series_250 s, params p
+  WHERE s.date BETWEEN p.baseline_start AND p.baseline_end
+),
+
+-- ----------------------------
+-- FINAL COMPARISON TABLE
+-- Percent change vs baseline:
+--   pct_change = 100 * (value - baseline) / baseline
+-- ----------------------------
+final AS (
+  SELECT
+    COALESCE(a.date, b.date) AS date,
+
+    a.temp_landweighted AS temp_1200,
+    b.temp_landweighted AS temp_250,
+
+    (SELECT base FROM baseline_1200) AS baseline_1200,
+    (SELECT base FROM baseline_250) AS baseline_250,
+
+    CASE
+      WHEN (SELECT base FROM baseline_1200) IS NULL OR (SELECT base FROM baseline_1200) = 0
+      THEN NULL
+      ELSE 100.0 * (a.temp_landweighted - (SELECT base FROM baseline_1200)) / (SELECT base FROM baseline_1200)
+    END AS pct_change_1200,
+
+    CASE
+      WHEN (SELECT base FROM baseline_250) IS NULL OR (SELECT base FROM baseline_250) = 0
+      THEN NULL
+      ELSE 100.0 * (b.temp_landweighted - (SELECT base FROM baseline_250)) / (SELECT base FROM baseline_250)
+    END AS pct_change_250,
+
+    -- Optional: difference between the two percent-change series
+    (CASE
+      WHEN (SELECT base FROM baseline_1200) IS NULL OR (SELECT base FROM baseline_1200) = 0
+      THEN NULL
+      ELSE 100.0 * (a.temp_landweighted - (SELECT base FROM baseline_1200)) / (SELECT base FROM baseline_1200)
+    END)
+    -
+    (CASE
+      WHEN (SELECT base FROM baseline_250) IS NULL OR (SELECT base FROM baseline_250) = 0
+      THEN NULL
+      ELSE 100.0 * (b.temp_landweighted - (SELECT base FROM baseline_250)) / (SELECT base FROM baseline_250)
+    END) AS pct_change_diff_1200_minus_250
+
+  FROM series_1200 a
+  FULL OUTER JOIN series_250 b
+    ON a.date = b.date
+)
+
+SELECT *
+FROM final
+ORDER BY date;
