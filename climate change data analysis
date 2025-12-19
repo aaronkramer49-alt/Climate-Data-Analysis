@@ -1,0 +1,58 @@
+-- analysis_queries.sql
+-- Create aggregated yearly tables (area-weighted by latitude) and a combined comparison table
+-- Assumes giss_temp_annual_raw and giss_temp_yoy_pct_raw are populated.
+
+-- NOTE: We weight by cos(latitude) to approximate area weighting. If lat is cell center in degrees, use radians conversion.
+
+-- 1) Materialized view: yearly area-weighted mean temperature (°C)
+CREATE MATERIALIZED VIEW IF NOT EXISTS yearly_mean_temp AS
+WITH src AS (
+  SELECT lat, lon, year, temp
+  FROM giss_temp_annual_raw
+  WHERE temp IS NOT NULL
+)
+SELECT
+  year,
+  SUM(temp * COS(RADIANS(lat))) / NULLIF(SUM(COS(RADIANS(lat))), 0) AS mean_temp,
+  COUNT(*) AS cells_used
+FROM src
+GROUP BY year
+ORDER BY year;
+
+-- 2) Materialized view: yearly area-weighted mean year-over-year percent-change (%)
+CREATE MATERIALIZED VIEW IF NOT EXISTS yearly_mean_yoy_pct AS
+WITH src AS (
+  SELECT lat, lon, year, pct_change
+  FROM giss_temp_yoy_pct_raw
+  WHERE pct_change IS NOT NULL
+)
+SELECT
+  year,
+  SUM(pct_change * COS(RADIANS(lat))) / NULLIF(SUM(COS(RADIANS(lat))), 0) AS mean_yoy_pct,
+  COUNT(*) AS cells_used
+FROM src
+GROUP BY year
+ORDER BY year;
+
+-- 3) Combined table for plotting and comparison (persisted)
+DROP TABLE IF EXISTS giss_temp_comparison;
+CREATE TABLE giss_temp_comparison AS
+SELECT
+  COALESCE(t.year, p.year) AS year,
+  t.mean_temp,
+  p.mean_yoy_pct
+FROM yearly_mean_temp t
+FULL OUTER JOIN yearly_mean_yoy_pct p USING (year)
+ORDER BY year;
+
+-- 4) Useful selects:
+-- SELECT * FROM yearly_mean_temp ORDER BY year;
+-- SELECT * FROM yearly_mean_yoy_pct ORDER BY year;
+-- SELECT * FROM giss_temp_comparison ORDER BY year;
+
+-- Refresh workflow when data changes:
+-- REFRESH MATERIALIZED VIEW yearly_mean_temp;
+-- REFRESH MATERIALIZED VIEW yearly_mean_yoy_pct;
+-- TRUNCATE giss_temp_comparison;
+-- INSERT INTO giss_temp_comparison SELECT COALESCE(t.year, p.year), t.mean_temp, p.mean_yoy_pct
+--   FROM yearly_mean_temp t FULL OUTER JOIN yearly_mean_yoy_pct p USING (year) ORDER BY COALESCE(t.year, p.year);
